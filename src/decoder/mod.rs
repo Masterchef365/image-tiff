@@ -131,10 +131,10 @@ pub struct Limits {
     /// 256MiB. If the entire image is decoded at once, then this will
     /// be the maximum size of the image. If it is decoded one strip at a
     /// time, this will be the maximum size of a strip.
-    decoding_buffer_size: usize,
+    pub decoding_buffer_size: usize,
     /// The maximum size of any ifd value in bytes, the default is
     /// 1MiB.
-    ifd_value_size: usize,
+    pub ifd_value_size: usize,
 }
 
 impl Default for Limits {
@@ -204,6 +204,7 @@ fn rev_hpredict(image: DecodingBuffer, size: (u32, u32), color_type: ColorType) 
         ColorType::Gray(8) | ColorType::Gray(16) => 1,
         ColorType::RGB(8) | ColorType::RGB(16) => 3,
         ColorType::RGBA(8) | ColorType::RGBA(16) | ColorType::CMYK(8) => 4,
+        ColorType::Other(sample_bits) => sample_bits.len(),
         _ => {
             return Err(TiffError::UnsupportedError(
                 TiffUnsupportedError::HorizontalPredictor(color_type),
@@ -250,37 +251,30 @@ impl<R: Read + Seek> Decoder<R> {
         Ok((self.width, self.height))
     }
 
-    pub fn colortype(&mut self) -> TiffResult<ColorType> {
+    pub fn colortype(&mut self) -> ColorType {
         match self.photometric_interpretation {
             // TODO: catch also [ 8, 8, 8, _] this does not work due to a bug in rust atm
             PhotometricInterpretation::RGB if self.bits_per_sample == [8, 8, 8, 8] => {
-                Ok(ColorType::RGBA(8))
+                ColorType::RGBA(8)
             }
             PhotometricInterpretation::RGB if self.bits_per_sample == [8, 8, 8] => {
-                Ok(ColorType::RGB(8))
+                ColorType::RGB(8)
             }
             PhotometricInterpretation::RGB if self.bits_per_sample == [16, 16, 16, 16] => {
-                Ok(ColorType::RGBA(16))
+                ColorType::RGBA(16)
             }
             PhotometricInterpretation::RGB if self.bits_per_sample == [16, 16, 16] => {
-                Ok(ColorType::RGB(16))
+                ColorType::RGB(16)
             }
             PhotometricInterpretation::CMYK if self.bits_per_sample == [8, 8, 8, 8] => {
-                Ok(ColorType::CMYK(8))
+                ColorType::CMYK(8)
             }
             PhotometricInterpretation::BlackIsZero | PhotometricInterpretation::WhiteIsZero
                 if self.bits_per_sample.len() == 1 =>
             {
-                Ok(ColorType::Gray(self.bits_per_sample[0]))
+                ColorType::Gray(self.bits_per_sample[0])
             }
-
-            // TODO: this is bad we should not fail at this point
-            _ => Err(TiffError::UnsupportedError(
-                TiffUnsupportedError::InterpretationWithBits(
-                    self.photometric_interpretation,
-                    self.bits_per_sample.clone(),
-                ),
-            )),
+            _ => ColorType::Other(self.bits_per_sample.clone().into_boxed_slice()),
         }
     }
 
@@ -358,15 +352,10 @@ impl<R: Read + Seek> Decoder<R> {
                     self.bits_per_sample = vec![val as u8]
                 }
             }
-            3 | 4 => {
+            _ => {
                 if let Some(val) = try!(self.find_tag_u32_vec(ifd::Tag::BitsPerSample)) {
                     self.bits_per_sample = val.iter().map(|&v| v as u8).collect()
                 }
-            }
-            _ => {
-                return Err(TiffError::UnsupportedError(
-                    TiffUnsupportedError::UnsupportedSampleDepth(self.samples),
-                ))
             }
         }
         Ok(())
@@ -532,7 +521,7 @@ impl<R: Read + Seek> Decoder<R> {
         length: u32,
         max_uncompressed_length: usize,
     ) -> TiffResult<usize> {
-        let color_type = try!(self.colortype());
+        let color_type = self.colortype();
         try!(self.goto_offset(offset));
         let (bytes, mut reader): (usize, Box<dyn EndianReader>) = match self.compression_method {
             CompressionMethod::None => {
@@ -604,6 +593,10 @@ impl<R: Read + Seek> Decoder<R> {
                         *byte = 0xff - *byte
                     }
                 }
+                bytes
+            }
+            (ColorType::Other(_), DecodingBuffer::U8(ref mut buffer)) => {
+                try!(reader.read_exact(&mut buffer[..bytes]));
                 bytes
             }
             (type_, _) => {
@@ -701,7 +694,7 @@ impl<R: Read + Seek> Decoder<R> {
                     rev_hpredict(
                         buffer.copy(),
                         (self.width, strip_height as u32),
-                        self.colortype()?,
+                        self.colortype(),
                     )?;
                 }
                 None => {
