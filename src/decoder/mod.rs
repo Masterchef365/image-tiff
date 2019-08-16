@@ -22,20 +22,12 @@ pub enum DecodingResult {
 }
 
 impl DecodingResult {
-    fn new_u8(size: usize, limits: &Limits) -> TiffResult<DecodingResult> {
-        if size > limits.decoding_buffer_size {
-            Err(TiffError::LimitsExceeded)
-        } else {
-            Ok(DecodingResult::U8(vec![0; size]))
-        }
+    fn new_u8(size: usize) -> DecodingResult {
+        DecodingResult::U8(vec![0; size])
     }
 
-    fn new_u16(size: usize, limits: &Limits) -> TiffResult<DecodingResult> {
-        if size > limits.decoding_buffer_size / 2 {
-            Err(TiffError::LimitsExceeded)
-        } else {
-            Ok(DecodingResult::U16(vec![0; size]))
-        }
+    fn new_u16(size: usize) -> DecodingResult {
+        DecodingResult::U16(vec![0; size])
     }
 
     pub fn as_buffer(&mut self, start: usize) -> DecodingBuffer {
@@ -122,28 +114,6 @@ struct StripDecodeState {
     strip_bytes: Vec<u32>,
 }
 
-/// Decoding limits
-#[derive(Clone, Debug)]
-pub struct Limits {
-    /// The maximum size of any `DecodingResult` in bytes, the default is
-    /// 256MiB. If the entire image is decoded at once, then this will
-    /// be the maximum size of the image. If it is decoded one strip at a
-    /// time, this will be the maximum size of a strip.
-    pub decoding_buffer_size: usize,
-    /// The maximum size of any ifd value in bytes, the default is
-    /// 1MiB.
-    pub ifd_value_size: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits {
-            decoding_buffer_size: 256 * 1024 * 1024,
-            ifd_value_size: 1024 * 1024,
-        }
-    }
-}
-
 /// The representation of a TIFF decoder
 ///
 /// Currently does not support decoding of interlaced images
@@ -154,7 +124,14 @@ where
 {
     reader: SmartReader<R>,
     byte_order: ByteOrder,
-    limits: Limits,
+    /// The maximum size of any `DecodingResult` in bytes, the default is
+    /// 256MiB. If the entire image is decoded at once, then this will
+    /// be the maximum size of the image. If it is decoded one strip at a
+    /// time, this will be the maximum size of a strip.
+    decoding_buffer_size: usize,
+    /// The maximum size of any ifd value in bytes, the default is
+    /// 1MiB.
+    ifd_value_size: usize,
     next_ifd: Option<u32>,
     ifd: Option<Directory>,
     width: u32,
@@ -225,7 +202,8 @@ impl<R: Read + Seek> Decoder<R> {
         Decoder {
             reader: SmartReader::wrap(r, ByteOrder::LittleEndian),
             byte_order: ByteOrder::LittleEndian,
-            limits: Default::default(),
+            decoding_buffer_size: 256 * 1024 * 1024,
+            ifd_value_size: 1024 * 1024,
             next_ifd: None,
             ifd: None,
             width: 0,
@@ -239,8 +217,13 @@ impl<R: Read + Seek> Decoder<R> {
         .init()
     }
 
-    pub fn with_limits(mut self, limits: Limits) -> Decoder<R> {
-        self.limits = limits;
+    pub fn with_decoding_buffer_size(mut self, size: usize) -> Decoder<R> {
+        self.decoding_buffer_size = size;
+        self
+    }
+
+    pub fn with_ifd_value_size(mut self, size: usize) -> Decoder<R> {
+        self.ifd_value_size = size;
         self
     }
 
@@ -479,9 +462,7 @@ impl<R: Read + Seek> Decoder<R> {
             Some(entry) => entry.clone(),
         };
 
-        let limits = self.limits.clone();
-
-        Ok(Some(try!(entry.val(&limits, self))))
+        Ok(Some(try!(entry.val(self))))
     }
 
     /// Tries to retrieve a tag and convert it to the desired type.
@@ -708,6 +689,28 @@ impl<R: Read + Seek> Decoder<R> {
         Ok(())
     }
 
+    fn new_buffer_from_bits_per_sample(&self, buffer_size: usize) -> TiffResult<DecodingResult> {
+        match self.bits_per_sample.iter().cloned().max().unwrap_or(8) {
+            n if n <= 8 => {
+                if buffer_size > self.decoding_buffer_size {
+                    return Err(TiffError::LimitsExceeded)
+                } 
+                Ok(DecodingResult::new_u8(buffer_size))
+            }
+            n if n <= 16 => {
+                if buffer_size > self.decoding_buffer_size / 2 {
+                    return Err(TiffError::LimitsExceeded)
+                } 
+                Ok(DecodingResult::new_u16(buffer_size))
+            }
+            n => {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
+                ))
+            }
+        }
+    }
+
     /// Read a single strip from the image and return it as a Vector
     pub fn read_strip(&mut self) -> TiffResult<DecodingResult> {
         self.initialize_strip_decoder()?;
@@ -724,19 +727,11 @@ impl<R: Read + Seek> Decoder<R> {
 
         let buffer_size = self.width as usize * strip_height * self.bits_per_sample.iter().count();
 
-        let mut result = match self.bits_per_sample.iter().cloned().max().unwrap_or(8) {
-            n if n <= 8 => DecodingResult::new_u8(buffer_size, &self.limits)?,
-            n if n <= 16 => DecodingResult::new_u16(buffer_size, &self.limits)?,
-            n => {
-                return Err(TiffError::UnsupportedError(
-                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
-                ))
-            }
-        };
+        let mut new_buffer = self.new_buffer_from_bits_per_sample(buffer_size)?;
 
-        self.read_strip_to_buffer(result.as_buffer(0))?;
+        self.read_strip_to_buffer(new_buffer.as_buffer(0))?;
 
-        Ok(result)
+        Ok(new_buffer)
     }
 
     /// Decodes the entire image and return it as a Vector
@@ -752,20 +747,12 @@ impl<R: Read + Seek> Decoder<R> {
         let buffer_size =
             self.width as usize * self.height as usize * self.bits_per_sample.iter().count();
 
-        let mut result = match self.bits_per_sample.iter().cloned().max().unwrap_or(8) {
-            n if n <= 8 => DecodingResult::new_u8(buffer_size, &self.limits)?,
-            n if n <= 16 => DecodingResult::new_u16(buffer_size, &self.limits)?,
-            n => {
-                return Err(TiffError::UnsupportedError(
-                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
-                ))
-            }
-        };
+        let mut new_buffer = self.new_buffer_from_bits_per_sample(buffer_size)?;
 
         for i in 0..self.strip_count()? as usize {
-            self.read_strip_to_buffer(result.as_buffer(samples_per_strip * i))?;
+            self.read_strip_to_buffer(new_buffer.as_buffer(samples_per_strip * i))?;
         }
 
-        Ok(result)
+        Ok(new_buffer)
     }
 }
