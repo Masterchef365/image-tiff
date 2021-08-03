@@ -149,7 +149,7 @@ pub enum TiffUnsupportedError {
 impl fmt::Display for TiffUnsupportedError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         use self::TiffUnsupportedError::*;
-        match *self {
+        match self {
             HorizontalPredictor(color_type) => write!(
                 fmt,
                 "Horizontal predictor for {:?} is unsupported.",

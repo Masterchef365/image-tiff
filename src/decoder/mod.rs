@@ -460,7 +460,7 @@ fn rev_hpredict(
     color_type: ColorType,
 ) -> TiffResult<()> {
     // TODO: use bits_per_sample.len() after implementing type 3 predictor
-    let samples = match color_type {
+    let samples = match &color_type {
         ColorType::Gray(8) | ColorType::Gray(16) | ColorType::Gray(32) | ColorType::Gray(64) => 1,
         ColorType::RGB(8) | ColorType::RGB(16) | ColorType::RGB(32) | ColorType::RGB(64) => 3,
         ColorType::RGBA(8)
@@ -471,6 +471,7 @@ fn rev_hpredict(
         | ColorType::CMYK(16)
         | ColorType::CMYK(32)
         | ColorType::CMYK(64) => 4,
+        ColorType::Other(v) => v.len(),
         _ => {
             return Err(TiffError::UnsupportedError(
                 TiffUnsupportedError::HorizontalPredictor(color_type),
@@ -567,12 +568,7 @@ impl<R: Read + Seek> Decoder<R> {
                 // than you think. A Baseline TIFF reader must skip over them gracefully,using the
                 // values of the SamplesPerPixel and BitsPerSample fields.
                 // > -- TIFF 6.0 Specification, Section 7, Additional Baseline requirements.
-                _ => Err(TiffError::UnsupportedError(
-                    TiffUnsupportedError::InterpretationWithBits(
-                        self.photometric_interpretation,
-                        self.bits_per_sample.clone(),
-                    ),
-                )),
+                _ => Ok(ColorType::Other(self.bits_per_sample.clone())),
             },
             PhotometricInterpretation::CMYK => match self.bits_per_sample[..] {
                 [c, m, y, k] if [c, c, c] == [m, y, k] => Ok(ColorType::CMYK(c)),
@@ -590,12 +586,7 @@ impl<R: Read + Seek> Decoder<R> {
             }
 
             // TODO: this is bad we should not fail at this point
-            _ => Err(TiffError::UnsupportedError(
-                TiffUnsupportedError::InterpretationWithBits(
-                    self.photometric_interpretation,
-                    self.bits_per_sample.clone(),
-                ),
-            )),
+            _ => Ok(ColorType::Other(self.bits_per_sample.clone())),
         }
     }
 
@@ -691,13 +682,12 @@ impl<R: Read + Seek> Decoder<R> {
                 .into());
             }
         }
-        match self.samples {
-            1 | 3 | 4 => {
-                if let Some(val) = self.find_tag_unsigned_vec(Tag::BitsPerSample)? {
-                    self.bits_per_sample = val;
-                }
-            }
-            _ => return Err(TiffUnsupportedError::UnsupportedSampleDepth(self.samples).into()),
+
+        if let Some(val) = self.find_tag_unsigned_vec(Tag::BitsPerSample)? {
+            self.bits_per_sample = val;
+        } else {
+            panic!("Could not find tag for bits per sample");
+            //return Err(TiffUnsupportedError::UnsupportedSampleDepth(self.samples).into())
         }
 
         let ifd = self.ifd.as_ref().unwrap();
@@ -1093,18 +1083,14 @@ impl<R: Read + Seek> Decoder<R> {
     ) -> TiffResult<()> {
         // Validate that the provided buffer is of the expected type.
         let color_type = self.colortype()?;
-        match (color_type, &buffer) {
+        match (color_type.clone(), &buffer) {
             (ColorType::RGB(n), _)
             | (ColorType::RGBA(n), _)
             | (ColorType::CMYK(n), _)
             | (ColorType::Gray(n), _)
                 if usize::from(n) == buffer.byte_len() * 8 => {}
             (ColorType::Gray(n), DecodingBuffer::U8(_)) if n <= 8 => {}
-            (type_, _) => {
-                return Err(TiffError::UnsupportedError(
-                    TiffUnsupportedError::UnsupportedColorType(type_),
-                ))
-            }
+            _ => {}
         }
 
         // Construct necessary reader to perform decompression.
@@ -1212,7 +1198,7 @@ impl<R: Read + Seek> Decoder<R> {
             Self::fix_endianness(&mut buffer.subrange(row_start..row_end), self.byte_order);
 
             if self.photometric_interpretation == PhotometricInterpretation::WhiteIsZero {
-                Self::invert_colors(&mut buffer.subrange(row_start..row_end), color_type);
+                Self::invert_colors(&mut buffer.subrange(row_start..row_end), color_type.clone());
             }
         }
 
